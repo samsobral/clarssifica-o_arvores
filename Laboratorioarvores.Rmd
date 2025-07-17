@@ -1,0 +1,285 @@
+---
+title: "Laboratório 2 - Métodos Baseados em Árvores e Florestas Aleatórias"
+author: 'Samuel, Luca, José, Ian '
+date: "07/05/2025"
+output: pdf_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, 
+                      fig.align = "center", fig.width = 6, fig.height = 6)
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(rpart)
+library(caret)
+library(patchwork)
+library(kableExtra)
+```
+
+# 1. Leitura dos Dados
+
+```{r load_data}
+mnist <- read_csv("MNIST0178.csv")
+mnist$y <- as.factor(mnist$y)
+mnist_teste <- read_csv("MNIST0178-teste.csv")
+```
+
+# 2. Visualização de Dígitos
+
+## (a) Visualização das Imagens
+
+Usamos as funções fornecidas `converte_df` e `visnum` para converter os vetores de covariáveis em data.frames e plotar as imagens em escala de cinza.
+
+```{r visualize_digits}
+converte_df <- function(vetor_covariaveis) {
+  vetor_covariaveis <- as.vector(unlist(vetor_covariaveis))
+  if (length(vetor_covariaveis) != 784) stop("O vetor deve ter 784 valores.")
+  pos_x <- rep(1:28, each = 28)
+  pos_y <- rep(1:28, times = 28)
+  data.frame(pos_x, pos_y, valor = vetor_covariaveis)
+}
+
+visnum <- function(df) {
+  df %>%
+    ggplot(aes(x = pos_y, y = pos_x, fill = valor)) +
+    geom_tile() +
+    scale_fill_gradient(low = "white", high = "black") +
+    theme_void() +
+    scale_y_reverse() +
+    theme(legend.position = "none")
+}
+
+im1 <- converte_df(mnist[1, -1])
+im3 <- converte_df(mnist[3, -1])
+im6 <- converte_df(mnist[6, -1])
+im7 <- converte_df(mnist[7, -1])
+(visnum(im1) + visnum(im3)) / (visnum(im6) + visnum(im7)) +
+  plot_annotation(title = "Dígitos 0, 1, 7 e 8 (Observações 1, 3, 6 e 7)")
+```
+
+As imagens mostram os dígitos 0 (observação 1), 1 (observação 3), 7 (observação 6) e 8 (observação 7).
+
+## (b) Expectativas para a Classificação
+
+Esperamos que o dígito 1 e o 7 sejam os mais dificeis de classificar devido à sua estrutura vertical simples, o dígito 7 pode ser confundido com o 1 se não tiver uma barra horizontal clara ou for inclinado, como em algumas caligrafias. O dígito 0 pode ser confundido com o 8 devido às suas formas circulares a depender da caligrafia. 
+
+# 3. Árvore de Classificação com rpart
+
+Nesta seção, treinamos uma árvore de decisão usando a função `rpart` e avaliamos seu desempenho com uma matriz de confusão.
+
+```{r train_tree}
+set.seed(123)
+n <- nrow(mnist)
+test_idx <- sample(1:n, size = round(0.3 * n))
+train <- mnist[-test_idx, ]
+test <- mnist[test_idx, ]
+
+modelo_arvore <- rpart(y ~ ., data = train, method = "class")
+predicoes <- predict(modelo_arvore, test, type = "class")
+confusao <- confusionMatrix(predicoes, test$y)
+```
+
+## Matriz de Confusão
+
+```{r }
+confusao$table %>% 
+  kable(caption = "Matriz de Confusão - Árvore de Decisão") %>% 
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+```{r metrics_tree}
+confusao$overall["Accuracy"] %>% round(4) %>% 
+  kable(caption = "Acurácia") %>% kable_styling()
+
+confusao$byClass[, c("Precision", "Recall", "Specificity")] %>% 
+  round(4) %>% kable(caption = "Métricas por Classe") %>% kable_styling()
+```
+
+A árvore alcançou uma acurácia de aproximadamente 91,3%, indicando bom desempenho. O dígito 0 teve a maior revocação (93,3%), enquanto o 8 teve a menor (88,3%). Inesperadamente, o dígito 8 foi confundido com o 1 e o 7, possivelmente devido a variações na caligrafia que tornam o 8 semelhante a um 1 inclinado ou a um 7 com traços extras. O dígito 1 também foi confundido com o 8, sugerindo que padrões complexos de escrita desafiam o modelo. Contrariando as expectativas, as confusões entre 0 e 8, e 1 e 7, foram menos frequentes.
+
+# 4. Florestas Aleatórias (com Estratégias Manuais)
+
+Implementamos uma floresta aleatória manualmente, variando o número de árvores (`n_trees`), o número de variáveis por divisão (`mtry`) e a profundidade máxima (`max_depth`). Avaliamos o desempenho com erro out-of-bag (OOB) e validação hold-out.
+
+```{r random_forest_functions}
+random_forest <- function(X, y, n_trees, mtry, max_depth) {
+  trees <- vector("list", n_trees)
+  oob_preds <- matrix(NA, nrow = nrow(X), ncol = n_trees)
+  for (i in 1:n_trees) {
+    sample_idx <- sample(1:nrow(X), size = nrow(X), replace = TRUE)
+    oob_idx <- setdiff(1:nrow(X), sample_idx)
+    features <- sample(colnames(X), mtry, replace = FALSE)
+    formula <- as.formula(paste("y ~", paste(features, collapse = "+")))
+    trees[[i]] <- rpart(
+      formula,
+      data = data.frame(X[sample_idx, ], y = y[sample_idx]),
+      method = "class",
+      control = rpart.control(maxdepth = max_depth, cp = 0.01)
+    )
+    if (length(oob_idx) > 0) {
+      oob_preds[oob_idx, i] <- predict(trees[[i]], newdata = X[oob_idx, ], type = "class")
+    }
+  }
+  oob_final <- apply(oob_preds, 1, function(x) {
+    if (all(is.na(x))) NA else names(which.max(table(x[!is.na(x)])))
+  })
+  oob_error <- mean(oob_final != y, na.rm = TRUE)
+  structure(list(trees = trees, classes = levels(y), oob_error = oob_error), class = "randomforest")
+}
+
+predict.randomforest <- function(object, newdata) {
+  all_preds <- sapply(object$trees, function(tree) {
+    available_features <- intersect(colnames(newdata), all.vars(tree$terms)[-1])
+    if (length(available_features) == 0) stop("Nenhuma variável correspondente em newdata")
+    as.character(predict(tree, newdata = newdata[, available_features, drop = FALSE], type = "class"))
+  })
+  final_preds <- apply(all_preds, 1, function(x) names(which.max(table(x))))
+  factor(final_preds, levels = object$classes)
+}
+
+holdout_gridsearch <- function(X, y, test_size = 0.3, n_trees_grid, mtry_grid, max_depth_grid) {
+  set.seed(123)
+  n <- nrow(X)
+  test_idx <- sample(1:n, size = round(test_size * n))
+  train_idx <- setdiff(1:n, test_idx)
+  X_train <- X[train_idx, ]
+  y_train <- y[train_idx]
+  X_test <- X[test_idx, ]
+  y_test <- y[test_idx]
+  param_grid <- expand.grid(n_trees = n_trees_grid, mtry = round(mtry_grid), max_depth = max_depth_grid)
+  results <- data.frame()
+  pb <- txtProgressBar(min = 0, max = nrow(param_grid), style = 3)
+  for (i in 1:nrow(param_grid)) {
+    params <- param_grid[i, ]
+    model <- random_forest(X = X_train, y = y_train, n_trees = params$n_trees, 
+                           mtry = params$mtry, max_depth = params$max_depth)
+    pred <- predict(model, X_test)
+    cm <- table(Predicted = pred, Actual = y_test)
+    accuracy <- sum(diag(cm)) / sum(cm)
+    results <- rbind(results, data.frame(
+      n_trees = params$n_trees, mtry = params$mtry, max_depth = params$max_depth,
+      oob_error = model$oob_error, test_accuracy = accuracy, test_error = 1 - accuracy
+    ))
+    setTxtProgressBar(pb, i)
+  }
+  close(pb)
+  results <- results[order(-results$test_accuracy), ]
+  list(results = results, best_params = results[1, 1:3], best_accuracy = results[1, "test_accuracy"])
+}
+```
+
+```{r grid_search}
+set.seed(123)
+grid_result <- holdout_gridsearch(
+  X = mnist[, 2:785], y = mnist$y, test_size = 0.3,
+  n_trees_grid = c(10, 50, 100), mtry_grid = c(28, 150), max_depth_grid = c(3, 5, 7)
+)
+
+grid_result$results %>% 
+  kable(digits = 4, caption = "Resultados da Busca em Grade") %>% 
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+O melhor modelo (n_trees = 100, mtry = 28, max_depth = 7) alcançou uma acurácia de teste de aproximadamente 95,1% e um erro OOB de cerca de 4,9%. Aumentar o número de árvores melhorou o desempenho, enquanto mtry = 28 superou 150, reduzindo o overfitting. A profundidade máxima de 7 capturou padrões mais complexos. A taxa de erro esperada em novos dados é de cerca de 5%.
+
+## Matriz de Confusão do Melhor Modelo
+
+```{r best_model_confusion}
+set.seed(123)
+best_model <- random_forest(
+  X = mnist[, 2:785], y = mnist$y,
+  n_trees = grid_result$best_params$n_trees,
+  mtry = grid_result$best_params$mtry,
+  max_depth = grid_result$best_params$max_depth
+)
+pred_rf <- predict(best_model, mnist[test_idx, 2:785])
+conf_rf <- confusionMatrix(pred_rf, mnist$y[test_idx])
+
+conf_rf$table %>% 
+  kable(caption = "Matriz de Confusão - Floresta Aleatória") %>% 
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+conf_rf$overall["Accuracy"] %>% round(4) %>% 
+  kable(caption = "Acurácia") %>% kable_styling()
+
+conf_rf$byClass[, c("Precision", "Recall", "Specificity")] %>% 
+  round(4) %>% kable(caption = "Métricas por Classe") %>% kable_styling()
+```
+
+A floresta aleatória melhorou significativamente em relação à árvore única, com menos confusões entre os dígitos 8 e 1, e 8 e 7.
+
+# 5. Análise dos Erros
+
+Identificamos uma observação para cada uma das 16 combinações de valores verdadeiros e preditos pelo melhor modelo de floresta aleatória e as visualizamos em um grid 4x4.
+
+```{r error_analysis}
+teste_com_pred <- data.frame(
+  verdadeiro = mnist$y[test_idx],
+  predito = pred_rf,
+  mnist[test_idx, ]
+)
+combinacoes <- expand.grid(verdadeiro = levels(mnist$y), predito = levels(mnist$y))
+selecionadas <- combinacoes %>%
+  rowwise() %>%
+  mutate(indice = which(teste_com_pred$verdadeiro == verdadeiro & 
+                        teste_com_pred$predito == predito)[1]) %>%
+  filter(!is.na(indice))
+
+imagens_selecionadas <- teste_com_pred[selecionadas$indice, ]
+converte_df_info <- function(vetor_covariaveis, verdadeiro, predito) {
+  vetor_covariaveis <- as.vector(unlist(vetor_covariaveis))
+  if (length(vetor_covariaveis) != 784) stop("O vetor deve ter 784 valores.")
+  pos_x <- rep(1:28, each = 28)
+  pos_y <- rep(1:28, times = 28)
+  df <- data.frame(pos_x, pos_y, valor = vetor_covariaveis)
+  df$verdadeiro <- verdadeiro
+  df$predito <- predito
+  df
+}
+
+df_imagens <- bind_rows(
+  lapply(1:nrow(imagens_selecionadas), function(i) {
+    linha <- imagens_selecionadas[i, ]
+    covariaveis <- select(linha, starts_with("x"))
+    converte_df_info(covariaveis, linha$verdadeiro, linha$predito)
+  })
+)
+
+visnum(df_imagens) +
+  facet_grid(rows = vars(verdadeiro), cols = vars(predito), switch = "y",
+             labeller = labeller(
+               .rows = function(x) paste("Verdadeiro =", x),
+               .cols = function(x) paste("Predito =", x)
+             )) +
+  theme_bw(base_size = 13) +
+  labs(x = "Verdadeiro", y = "Predito",
+       title = "16 Combinações de Valores Verdadeiros vs. Preditos") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.ticks = element_blank(),
+        axis.text = element_blank(),
+        panel.grid = element_blank(),
+        legend.position = "none")
+```
+
+Os dígitos corretamente classificados (diagonal principal) têm formas claras e bem definidas. Os erros ocorrem em casos ambíguos:
+- **0 predito como 8**: O 0 tem uma forma mais estreita e fechada, parecida com um 8 com loops conectados.
+- **1 predito como 7**: O 1 tem um traço inclinado ou uma base serifada, semelhante a um 7 sem barra horizontal.
+- **7 predito como 1**: O 7 não tem uma barra horizontal clara, parecendo um 1 reto.
+- **8 predito como 0**: O 8 tem loops achatados, parecendo um oval simples como o 0.
+
+Esses erros sugerem que variações na caligrafia, como inclinações, traços incompletos ou formas irregulares, contribuem para as classificações incorretas. Não foi identificado um padrão claro além das semelhanças visuais entre os pares mencionados.
+
+# 6. Predição em Novos Dados
+
+Usamos o melhor modelo de floresta aleatória para prever os dígitos no conjunto `MNIST0178-teste.csv` (4117 observações) e salvamos as predições em um arquivo CSV.
+
+```{r predict_test}
+set.seed(123)
+predicoes_teste <- predict(best_model, mnist_teste)
+resultado <- data.frame(predicao = as.numeric(as.character(predicoes_teste)))
+write_csv(resultado, "predicoes_MNIST0178.csv")
+```
+
+O arquivo `predicoes_MNIST0178.csv` contém uma coluna `predicao` com os valores preditos (0, 1, 7, 8) para as 4117 imagens de teste.
+
